@@ -8,10 +8,12 @@
 3.需要定义一个数据清洗词表的 txt文件  里面可写正则表达式
 4.需要手动创建 record.txt文件 用来保存已经抓取过的关键词
 5.可以多线程  但未集成 代理
-6.需要安装 bluextracter jieba pymysql lxml  requests等第三方包
+6.需要安装 bluextracter jieba pymysql lxml  requests redis等第三方包
 7.手动设置 文章标题 与 关键词 相似度的判断分数 会影响到采集结果数量
 8.手动添加 HEADERS 中的UA  以及COOKIES中的百度cookies
-9.使用问题请咨询 QQ：1129949173
+9.利用redis数据缓存进行url判断，已抓取过的url不再抓取
+10.每篇文章提取最长的两个句子 求md5值来判断是否重复
+使用问题请咨询 QQ：1129949173
 '''
 import requests
 from bluextracter import Extractor
@@ -24,6 +26,8 @@ import random
 import time
 import jieba
 import pymysql
+import redis
+from hashlib import md5
 
 curdir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(curdir)
@@ -62,6 +66,31 @@ COOKIES = [
     r'BAIDUID=A55D609BF6D2BFC9D55001A0665B012A:FG=1; BIDUPSID=A55D609BF6D2BFC9D55001A0665B012A; PSTM=1565409473; H_WISE_SIDS=130611_137735_132923_128699_136650_135964_136630_132549_134982_126062_136436_137157_120154_137001_133981_136365_132910_136455_137691_135846_131246_137743_132378_136680_118896_118873_118852_118820_118805_136687_107315_132783_136799_136430_136095_133351_137901_137221_136861_129656_136196_137104_133847_132552_137467_134046_129643_131423_137466_136740_110085_137863_127969_137625_136612_135416_128196_137695_136635_137096_137208_134383_136413_137450_136988; BDUSS=3RpVXhIbktSdGdmbUJjZnRiazJEVEppTjlPcHdUak1JYjFDT3ladH5xamZjZmxkRVFBQUFBJCQAAAAAAAAAAAEAAAB4NA4naGFpc2hlbmc5OQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAN~k0V3f5NFdZ; uc_login_unique=85d11417a5dfe306fc2a2f3b2eb9828d; uc_recom_mark=cmVjb21tYXJrXzI4MDAyOTQ5; SIGNIN_UC=70a2711cf1d3d9b1a82d2f87d633bd8a03357167400; BDRCVFR[tFA6N9pQGI3]=mk3SLVN4HKm; H_PS_PSSID=; delPer=0; PSINO=3; BDORZ=FFFB88E999055A3F8A630C64834BD6D0',
 ]
 
+def get_pro():
+    # 代理服务器
+    proxyHost = "http-dyn.abuyun.com"
+    proxyPort = "9020"
+
+    # 代理隧道验证信息
+    proxyUser = "HY9969190461286D"
+    proxyPass = "CECA5103E867B917"
+
+    proxyMeta = "http://%(user)s:%(pass)s@%(host)s:%(port)s" % {
+        "host" : proxyHost,
+        "port" : proxyPort,
+        "user" : proxyUser,
+        "pass" : proxyPass,
+    }
+
+    proxies = {
+        "http"  : proxyMeta,
+        "https" : proxyMeta,
+    }
+    return proxies
+
+# 建立本地redis数据库链接池  如果未设置连接密码  就去掉最后的password或设置为None
+pool = redis.ConnectionPool(host='127.0.0.1', db=3, port=6379, decode_responses=True, password='root')
+
 class BaiduRank(Thread):
     def __init__(self, kw_q, url_q, config, page):
         super().__init__()
@@ -85,6 +114,7 @@ class BaiduRank(Thread):
         self.config = config
         self.record = open('record.txt', 'a+', encoding='utf-8')
         self.record_word = set(w.strip() for w in open('record.txt', 'r', encoding='utf-8').readlines())
+        self.pool = self.config['pool']
 
     def run(self):
         while True:
@@ -100,7 +130,7 @@ class BaiduRank(Thread):
             finally:
                 self.kw_q.task_done()
 
-    def download(self,wd,retries = 4):
+    def download(self,wd,retries = 4,proxies=None):
         url = 'https://www.baidu.com/s?'
         paras = {
             'ie':'utf-8',
@@ -112,8 +142,9 @@ class BaiduRank(Thread):
             req = requests.get(url,params=paras,headers=self.header,timeout=20)
         except requests.RequestException as e:
             if retries > 0:
-                time.sleep(3)
-                self.download(wd,retries - 1)
+                time.sleep(1)
+                print('百度页面重试抓取ing...')
+                self.download(wd, retries - 1, proxies=get_pro())
             html = None
             # print('百度页面抓取出错',e)
             self.kw_q.put(wd)
@@ -135,7 +166,7 @@ class BaiduRank(Thread):
                 req = requests.head(item)
             except requests.RequestException as e:
                 if retries > 0:
-                    time.sleep(3)
+                    time.sleep(1)
                     return self.extra_url(wd, html, retries-1)
                 # print('链接解密失败', e)
                 self.kw_q.put(wd)
@@ -145,7 +176,12 @@ class BaiduRank(Thread):
                 try:
                     if 'htm' in link  and '.baidu.com' not in link:
                         # print('真实链接为', link)
-                        self.url_q.put((wd,link,likeword))
+                        crawl_url = self.record_url_save(link)
+                        if crawl_url:
+                            self.url_q.put((wd, link, likeword))
+                        else:
+                            print("当前链接在redis中已有记录", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+                            continue
                 except:
                     continue
                 else:
@@ -156,6 +192,12 @@ class BaiduRank(Thread):
         self.record.write(f'{kw}\n')
         self.record.flush()
         self.record_word.add(kw)
+    
+    # 记录已抓取过的url
+    def record_url_save(self, url):
+        r = redis.Redis(connection_pool=self.pool)
+        s = r.set(url,1,nx=True)
+        return s
 
 
 class ArtSpilder(Thread):
@@ -171,6 +213,7 @@ class ArtSpilder(Thread):
         self.stop_word = '|'.join(item.strip() for item in open(crawl_config["clean_word"], 'r', encoding='utf-8-sig').readlines())
         self.end_compile = re.compile(r'([,，。！!?？、\n~])', re.I)
         self.con_compile = re.compile(fr'({self.stop_word})', re.I)
+        self.pool = self.crawl_config["pool"]
 
     def run(self):
         while True:
@@ -179,6 +222,11 @@ class ArtSpilder(Thread):
                 source = self.download(url)
                 if source is None:
                     print("获取文章内容失败..")
+                    del_res = self.del_redis_url(url)
+                    if del_res:
+                        print("已从redis删除未抓取成功的链接")
+                    else:
+                        print('从redis删除未成功抓取链接失败')
                     continue
                 # print('正在抓取--->:',url)
                 con_dict = self.extrac_art(url, source, wd, likeword)
@@ -189,17 +237,17 @@ class ArtSpilder(Thread):
                 self.url_q.task_done()
                 
 
-    def download(self,url,retries = 4):
+    def download(self,url,retries = 4, proxies=None):
         endco = ['utf8','utf-8','gbk','gb2312']
         try:
-            req = requests.get(url,headers=self.headers,timeout=15)
-            s = requests.session()
-            s.keep_alive = False
+            req = requests.get(url,headers=self.headers, timeout=15, proxies=proxies)
+            # s = requests.session()
+            # s.keep_alive = False
         except requests.RequestException as e:
             if retries > 0:
-                time.sleep(3)
-                return self.download(url,retries - 1)
-            
+                print("文章内容抓取重试ing....")
+                time.sleep(1)
+                return self.download(url, retries - 1, proxies=get_pro())
             # print('文章页抓取失败:',e)
             html = None
         else:
@@ -233,19 +281,23 @@ class ArtSpilder(Thread):
             con_body = self.end_compile.sub(r'\g<1>\n', content)
             con_arr = con_body.split('\n')
             clean_body = [] # 保存清洗之后的数据
-            # 对切割之后的数据进行清洗
+            # 2.对切割之后的数据进行清洗
             for p in con_arr:
                 if self.con_compile.search(p):
                     continue
                 else:
                     clean_body.append(p)
-            clean_content = "".join(clean_body)
+            
+            clean_content = "".join(clean_body) # 已经切割完成 且清洗完成的新内容
+            longer_str = self.get_longer_sentence(clean_content)
+            sign = md5(longer_str.encode("utf-8")).hexdigest()
             content_dict = {
                 'title':title,
                 'content':clean_content,
                 'url': url,
                 "word": wd,
-                "likeword": likeword
+                "likeword": likeword,
+                "sign": sign
             }
         else:
             content_dict = {
@@ -253,7 +305,8 @@ class ArtSpilder(Thread):
                 'content':'',
                 'url': url,
                 "word": wd,
-                "likeword": likeword
+                "likeword": likeword,
+                "sign": sign
             }
         return content_dict
     
@@ -263,21 +316,24 @@ class ArtSpilder(Thread):
         title = con['title']
         content = con['content']
         if self.count_simisc(wd, title) < self.crawl_config["limit_score"]:
-            print("相关度太低  不保存: ", title)
+            # print("相关度太低  不保存: ", title)
             return
-        if len(content)< 300 or len(title) < 5 or '404错误' in title:
+        if len(content)< 300 or len(title) < 4 or '404错误' in title:
             # print("数据质量低 不保存")
             return
         if self.crawl_config["save_path"] == "mysql":
             try:
-                
                 with self.conn.cursor() as cursor:
-                    sql = f"INSERT IGNORE INTO `{self.crawl_config['table_name']}` (`title`, `content`, `url`, `word`, `likeword`) VALUES(%s, %s, %s, %s, %s)"
-                    cursor.execute(sql, args=(con["title"], con["content"], con["url"], con["word"], con["likeword"]))
+                    sql = f"INSERT IGNORE INTO `{self.crawl_config['table_name']}` (`title`, `content`, `url`, `word`, `likeword`, `sign`) VALUES(%s, %s, %s, %s, %s, %s)"
+                    res = cursor.execute(sql, args=(con["title"], con["content"], con["url"], con["word"], con["likeword"], con["sign"]))
             except Exception as e:
                 print('数据库链接失败', e)
             else:
-                print(f'--成功写入数据: {title}')
+                if res:
+                    print(f'--成功写入数据: {title}')
+                else:
+                    # print(f"链接重复 不保存{con['url']}")
+                    pass
                 return True
         else:
             # 保存位置
@@ -294,10 +350,26 @@ class ArtSpilder(Thread):
                 print(f"本地保存失败: {title} ---", e)
                 pass
 
+    # 提取页面上的编码
     def _extra_encod(self,html):
         encod = re.findall(r'<meta.*?charset="?([\w-]*)".*>', html, re.I)
         encod = encod[0] if encod else "utf-8"
         return encod
+    
+    # 提取段落中最长的句子
+    def get_longer_sentence(self, string):
+        if not isinstance(string, str):
+            return
+        if string[0] in ',，。！？,：:、':
+            string = string[1:]
+        new_sentence = self.end_compile.sub(r'\g<1>\n', string)
+        new_sentence = new_sentence.split('\n')
+        longer_string = [s for s in new_sentence if len(s) > 30]
+        if not longer_string:
+            longer_string = new_sentence
+        longer_string.sort(key= lambda x:len(x), reverse=True)
+        longer_sentence = longer_string[0] + longer_string[1]
+        return longer_sentence
     
     # 计算相关度
     @staticmethod
@@ -306,10 +378,18 @@ class ArtSpilder(Thread):
         tt_set = set(jieba.lcut_for_search(title))
         simisc = wd_set - tt_set
         try:
-            score = 1 - simisc / len(wd_set)
+            score = 1 - len(simisc) / len(wd_set)
         except:
             score = 1.0
         return score
+    
+    # 如果文章url未抓取成功 就从redis中删除记录
+    def del_redis_url(self,url):
+        if not isinstance(url, str):
+            return False
+        r = redis.Redis(connection_pool=self.pool)
+        s = r.delete(url)
+        return s
 
 def go_spider(config, dbconfig):
     kw_q = Queue()
@@ -328,12 +408,12 @@ def go_spider(config, dbconfig):
         else:
             continue
 
-    for i in range(20):
+    for i in range(50):
         br = BaiduRank(kw_q, url_q, config, num)
         br.setDaemon(True)
         br.start()
 
-    for j in range(20):
+    for j in range(100):
         art = ArtSpilder(url_q, config, dbconfig)
         art.setDaemon(True)
         art.start()
@@ -348,20 +428,23 @@ if __name__ == "__main__":
         port= 3306,
         user= 'root',  # msyql用户名
         password= 'root',  # MySQL密码
-        db= 'baiduspider',  # 数据库名称
+        db= 'game',  # 数据库名称
         autocommit= True,
         charset= 'utf8mb4'  # 数据库的字符集编码
     )
-    # 抓取爬虫相关配置变量
+    # 抓取爬虫相关配置变量  
     crawl_config = dict(
+        pool=pool,
         target_file= "words.txt",  # 要抓取的关键词文件名
         dbconfig= dbconfig,
-        table_name= "juzi",  # 数据保存到哪个表里面
-        save_path= "mysql",  # 如果填写的值是 mysql，那么数据就会保存到MySQL数据库，如果是其它名称，那么就会保存到指定的文件夹
-        record= "record.txt", #已采集过的关键词保存到哪个文件
-        page= 25, #采集百度排名前多少个
-        clean_word= "clean.txt", #文章清洗词表  可以写正则表达式
+        table_name= "fgo",  # 数据保存到哪个表里面
+        save_path= "mysql",  # 如果填写的值是 mysql，那么数据就会保存到MySQL数据库，如果是其它名称，那么就会保存到本地指定的文件夹
+        record= "record.txt", # 已采集过的关键词保存到哪个文件
+        page= 30, # 采集百度排名前多少个
+        clean_word= "clean.txt", # 文章清洗词表  可以写正则表达式
         limit_score= 0.4 # 定义文章与关键词相似度判断的最低分数
     )
+    start_time = time.time()
     go_spider(crawl_config, dbconfig)
+    print(f'用时{time.time() - start_time}')
     print('执行完毕.....')
